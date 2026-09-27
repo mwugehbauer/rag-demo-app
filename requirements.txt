@@ -1,0 +1,8 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+streamlit>=1.40,<2
+pypdf>=5.0,<7
+chromadb>=1.0,<2
+sentence-transformers>=3.3,<6
+pandas>=2.2,<3
+torch
+torchvision
