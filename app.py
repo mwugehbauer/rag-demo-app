@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
-import os
 import re
 from pathlib import Path
 from typing import Any
@@ -12,6 +12,7 @@ from chromadb.errors import NotFoundError
 import pandas as pd
 import streamlit as st
 from pypdf import PdfReader
+from pypdf.errors import PdfReadError
 from sentence_transformers import SentenceTransformer
 
 
@@ -19,13 +20,11 @@ from sentence_transformers import SentenceTransformer
 # Configuration
 # -----------------------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent
-DOCUMENT_DIR = BASE_DIR / "documents"
 INDEX_ROOT = BASE_DIR / ".chroma_demo"
 
-DOCUMENTS = {
-    "Prüfungsordnung (PO 2026)": DOCUMENT_DIR / "PO_2026_MA_BM.pdf",
-    "Modulhandbuch Master PO26": DOCUMENT_DIR / "Modulhandbuch_Master_PO26__Stand_16.09.26.pdf",
-}
+# Limits for student uploads
+MAX_DOCUMENTS = 3
+MAX_FILE_SIZE_MB = 20
 
 EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 COLLECTION_NAME = "hochschule_koblenz_rag_demo"
@@ -50,11 +49,13 @@ def clean_text(text: str) -> str:
 
 
 @st.cache_data(show_spinner=False)
-def extract_pdf_pages(pdf_path: str, modified_time: float) -> list[dict[str, Any]]:
+def extract_pdf_pages(file_name: str, data: bytes) -> list[dict[str, Any]]:
     """Extract text page-by-page so retrieval results retain a source page."""
-    del modified_time  # cache-busting argument; not otherwise needed
+    try:
+        reader = PdfReader(io.BytesIO(data))
+    except PdfReadError as exc:
+        raise RuntimeError(f"'{file_name}' konnte nicht als PDF gelesen werden.") from exc
 
-    reader = PdfReader(pdf_path)
     pages: list[dict[str, Any]] = []
 
     for page_number, page in enumerate(reader.pages, start=1):
@@ -62,7 +63,7 @@ def extract_pdf_pages(pdf_path: str, modified_time: float) -> list[dict[str, Any
         if text:
             pages.append(
                 {
-                    "source": Path(pdf_path).name,
+                    "source": file_name,
                     "page": page_number,
                     "text": text,
                 }
@@ -122,16 +123,15 @@ def get_embedding_model() -> SentenceTransformer:
 
 
 def config_fingerprint(
-    selected_paths: list[Path], chunk_size: int, overlap: int
+    documents: list[dict[str, Any]], chunk_size: int, overlap: int
 ) -> str:
     payload = {
         "documents": [
             {
-                "path": str(path.resolve()),
-                "mtime": path.stat().st_mtime,
-                "size": path.stat().st_size,
+                "name": doc["name"],
+                "sha1": hashlib.sha1(doc["data"]).hexdigest(),
             }
-            for path in selected_paths
+            for doc in documents
         ],
         "chunk_size": chunk_size,
         "overlap": overlap,
@@ -142,16 +142,23 @@ def config_fingerprint(
 
 
 def build_index(
-    selected_paths: list[Path], chunk_size: int, overlap: int
+    documents: list[dict[str, Any]], chunk_size: int, overlap: int
 ) -> dict[str, Any]:
     """Parse PDFs, create chunks, embed them and store them in ChromaDB."""
     pages: list[dict[str, Any]] = []
-    for path in selected_paths:
-        pages.extend(extract_pdf_pages(str(path), path.stat().st_mtime))
+    empty_documents: list[str] = []
+    for doc in documents:
+        doc_pages = extract_pdf_pages(doc["name"], doc["data"])
+        if not doc_pages:
+            empty_documents.append(doc["name"])
+        pages.extend(doc_pages)
 
     chunks = create_chunks(pages, chunk_size, overlap)
     if not chunks:
-        raise RuntimeError("Es konnten keine Chunks erzeugt werden.")
+        raise RuntimeError(
+            "Es konnten keine Chunks erzeugt werden. Enthalten die PDFs eine Textebene? "
+            "Gescannte PDFs (nur Bilder) werden nicht unterstützt."
+        )
 
     model = get_embedding_model()
     embeddings = model.encode(
@@ -161,7 +168,7 @@ def build_index(
         batch_size=32,
     )
 
-    fingerprint = config_fingerprint(selected_paths, chunk_size, overlap)
+    fingerprint = config_fingerprint(documents, chunk_size, overlap)
     index_path = INDEX_ROOT / fingerprint
 
     # Rebuild cleanly whenever the user explicitly clicks "Index erstellen".
@@ -209,7 +216,8 @@ def build_index(
         "embedding_dimension": int(embeddings.shape[1]),
         "chunk_size": chunk_size,
         "overlap": overlap,
-        "documents": [path.name for path in selected_paths],
+        "documents": [doc["name"] for doc in documents],
+        "empty_documents": empty_documents,
     }
 
 
@@ -291,25 +299,43 @@ def overlap_preview(previous_text: str, current_text: str, configured_overlap: i
 # -----------------------------------------------------------------------------
 st.title("RAG Lab: Chunking, Embeddings & Retrieval")
 st.caption(
-    "Didaktische Demo mit Prüfungsordnung und Modulhandbuch: "
+    "Didaktische Demo mit eigenen Dokumenten: "
     "PDF → Chunking → Embeddings → ChromaDB → Top-k Retrieval → Augmented Prompt"
 )
 
-missing_docs = [label for label, path in DOCUMENTS.items() if not path.exists()]
-if missing_docs:
-    st.error(
-        "Folgende Dokumente fehlen im Ordner 'documents': " + ", ".join(missing_docs)
-    )
-    st.stop()
-
 with st.sidebar:
-    st.header("RAG-Parameter")
+    st.header("Dokumente")
 
-    selected_labels = st.multiselect(
-        "Dokumente",
-        options=list(DOCUMENTS.keys()),
-        default=list(DOCUMENTS.keys()),
+    uploaded_files = st.file_uploader(
+        "PDFs hochladen",
+        type=["pdf"],
+        accept_multiple_files=True,
+        help=f"Maximal {MAX_DOCUMENTS} PDFs mit je bis zu {MAX_FILE_SIZE_MB} MB.",
     )
+
+    # Validate uploads: size limit, duplicates, max number of documents.
+    selected_docs: list[dict[str, Any]] = []
+    seen_hashes: set[str] = set()
+    for uploaded in uploaded_files or []:
+        data = uploaded.getvalue()
+        if len(data) > MAX_FILE_SIZE_MB * 1024 * 1024:
+            st.warning(f"'{uploaded.name}' ist größer als {MAX_FILE_SIZE_MB} MB und wird ignoriert.")
+            continue
+        content_hash = hashlib.sha1(data).hexdigest()
+        if content_hash in seen_hashes:
+            st.warning(f"'{uploaded.name}' wurde doppelt hochgeladen und wird ignoriert.")
+            continue
+        seen_hashes.add(content_hash)
+        selected_docs.append({"name": uploaded.name, "data": data})
+
+    if len(selected_docs) > MAX_DOCUMENTS:
+        st.warning(
+            f"Es sind maximal {MAX_DOCUMENTS} Dokumente erlaubt. "
+            f"Nur die ersten {MAX_DOCUMENTS} werden verwendet."
+        )
+        selected_docs = selected_docs[:MAX_DOCUMENTS]
+
+    st.header("RAG-Parameter")
 
     chunk_size = st.slider(
         "Chunk Size (Wörter)",
@@ -348,22 +374,22 @@ with st.sidebar:
         use_container_width=True,
     )
 
-selected_paths = [DOCUMENTS[label] for label in selected_labels]
-
 if build_clicked:
-    if not selected_paths:
-        st.sidebar.error("Bitte mindestens ein Dokument auswählen.")
+    if not selected_docs:
+        st.sidebar.error("Bitte mindestens ein PDF hochladen.")
     else:
         with st.spinner(
             "PDFs lesen, Chunks erzeugen, Embeddings berechnen und ChromaDB aufbauen …"
         ):
             try:
                 st.session_state["rag_index"] = build_index(
-                    selected_paths, chunk_size, overlap
+                    selected_docs, chunk_size, overlap
                 )
                 st.session_state.pop("retrieval_results", None)
                 st.session_state.pop("retrieval_question", None)
                 st.sidebar.success("Index erstellt.")
+            except RuntimeError as exc:
+                st.sidebar.error(str(exc))
             except Exception as exc:
                 st.sidebar.exception(exc)
 
@@ -371,16 +397,16 @@ index_state = st.session_state.get("rag_index")
 
 if index_state is None:
     st.info(
-        "Wähle links die Dokumente und RAG-Parameter und klicke anschließend auf "
-        "**Index erstellen / neu aufbauen**. Beim ersten Start wird das Embedding-Modell "
-        "einmalig heruntergeladen."
+        f"Lade links bis zu {MAX_DOCUMENTS} PDFs hoch, wähle die RAG-Parameter und klicke "
+        "anschließend auf **Index erstellen / neu aufbauen**. Beim ersten Start wird das "
+        "Embedding-Modell einmalig heruntergeladen."
     )
 
     st.markdown(
         """
 ### Was die App demonstriert
 
-1. **Parsing:** Text wird aus den PDFs extrahiert.
+1. **Parsing:** Text wird aus den hochgeladenen PDFs extrahiert.
 2. **Chunking:** Text wird in überlappende Wissenseinheiten zerlegt.
 3. **Embeddings:** Jeder Chunk wird in einen numerischen Vektor übersetzt.
 4. **Vector Store:** ChromaDB speichert Text, Metadaten und Vektoren.
@@ -390,11 +416,17 @@ if index_state is None:
     )
     st.stop()
 
-current_fingerprint = config_fingerprint(selected_paths, chunk_size, overlap) if selected_paths else ""
+current_fingerprint = config_fingerprint(selected_docs, chunk_size, overlap) if selected_docs else ""
 if current_fingerprint != index_state["fingerprint"]:
     st.warning(
-        "Du hast Dokumentauswahl oder Chunking-Parameter seit dem letzten Index-Build geändert. "
+        "Du hast Dokumente oder Chunking-Parameter seit dem letzten Index-Build geändert. "
         "Klicke links auf **Index erstellen / neu aufbauen**, damit die Änderungen wirksam werden."
+    )
+
+if index_state["empty_documents"]:
+    st.warning(
+        "Aus folgenden Dokumenten konnte kein Text extrahiert werden (evtl. gescannte PDFs): "
+        + ", ".join(index_state["empty_documents"])
     )
 
 # Index summary
@@ -501,24 +533,9 @@ with chunk_tab:
 with retrieval_tab:
     st.subheader("Welche Chunks findet die Vektorsuche?")
 
-    presets = [
-        "Wie viele ECTS hat das Modul Künstliche Intelligenz und Strategisches IT-Management?",
-        "Welche Voraussetzungen gelten für die Masterarbeit?",
-        "Wie lange beträgt die Regelstudienzeit?",
-        "Welche Schwerpunktbereiche gibt es?",
-        "Welche Prüfungsformen sind im Master Business Management vorgesehen?",
-    ]
-
-    preset = st.selectbox(
-        "Beispielfrage",
-        options=["Eigene Frage"] + presets,
-    )
-
-    default_question = "" if preset == "Eigene Frage" else preset
     question = st.text_area(
         "Frage",
-        value=default_question,
-        placeholder="z. B. Welche Voraussetzungen gelten für die Masterarbeit?",
+        placeholder="Stelle eine Frage zu den hochgeladenen Dokumenten …",
         height=90,
     )
 
@@ -591,6 +608,6 @@ with prompt_tab:
 
 st.divider()
 st.caption(
-    "Lehrdemo: lokale Verarbeitung der beiden bereitgestellten Hochschuldokumente. "
+    "Lehrdemo: lokale Verarbeitung der hochgeladenen Dokumente. "
     "Die App nutzt ein mehrsprachiges Sentence-Transformer-Modell und ChromaDB."
 )

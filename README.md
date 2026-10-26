@@ -4,10 +4,12 @@ Eine kleine Streamlit-Lehrdemo für:
 
 **PDF → Parsing → Chunking → Embeddings → ChromaDB → Top-k Retrieval → Augmented Prompt**
 
-Die beiden bereitgestellten Dokumente sind bereits im Ordner `documents/` enthalten:
+Studierende laden ihre eigenen PDFs direkt in der App hoch (Sidebar). Standardmäßig sind
+maximal **3 PDFs** mit je bis zu **20 MB** erlaubt; die Grenzen lassen sich oben in `app.py`
+über `MAX_DOCUMENTS` und `MAX_FILE_SIZE_MB` anpassen.
 
-- `PO_2026_MA_BM.pdf`
-- `Modulhandbuch_Master_PO26__Stand_16.09.26.pdf`
+Die PDFs im Ordner `documents/` (Prüfungsordnung und Modulhandbuch) können als Beispieldateien
+zum Hochladen verwendet werden. Gescannte PDFs ohne Textebene werden nicht unterstützt.
 
 ## Empfohlene Umgebung
 
@@ -57,7 +59,7 @@ Der Browser öffnet normalerweise automatisch `http://localhost:8501`.
 
 ## 5. In der App
 
-1. Beide Dokumente auswählen.
+1. Ein bis drei PDFs in der Sidebar hochladen.
 2. `Chunk Size = 250`, `Overlap = 50`, `Top-k = 5` belassen.
 3. **Index erstellen / neu aufbauen** anklicken.
 4. Im Tab **Chunks verstehen** einzelne Chunks und den Overlap ansehen.
