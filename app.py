@@ -81,11 +81,14 @@ def is_text_document(file_name: str) -> bool:
 
 
 @st.cache_data(show_spinner=False)
-def extract_markdown_sections(file_name: str, data: bytes) -> list[dict[str, Any]]:
-    """Split Markdown/text at '#' and '##' headings; each section acts like a page.
+def extract_markdown_sections(
+    file_name: str, data: bytes, split_level: int = 2
+) -> list[dict[str, Any]]:
+    """Split Markdown/text at headings up to `split_level` ('#' = 1, '##' = 2, '###' = 3).
 
-    Each section starts with its heading path (e.g. "Modulname › Prüfungsformen"),
-    so a chunk still names the module it belongs to.
+    Each section acts like a page and starts with its heading path
+    (e.g. "Modulname › Prüfungsformen"), so a chunk still names the module it
+    belongs to. Deeper headings stay inside their section as plain text.
     """
     try:
         raw = data.decode("utf-8-sig")
@@ -93,15 +96,14 @@ def extract_markdown_sections(file_name: str, data: bytes) -> list[dict[str, Any
         raw = data.decode("cp1252", errors="replace")
 
     sections: list[dict[str, Any]] = []
-    title = ""
-    heading = ""
+    headings: list[str] = [""] * split_level
     lines: list[str] = []
 
     def flush() -> None:
         text = clean_text("\n".join(lines))
         if not text:
             return
-        path = " › ".join(part for part in (title, heading) if part)
+        path = " › ".join(part for part in headings if part)
         label = path or "Einleitung"
         number = len(sections) + 1
         sections.append(
@@ -114,14 +116,14 @@ def extract_markdown_sections(file_name: str, data: bytes) -> list[dict[str, Any
         )
 
     for line in raw.splitlines():
-        match = re.match(r"^(#{1,2})\s+(.+?)\s*#*\s*$", line)
-        if match:
+        match = re.match(r"^(#{1,6})\s+(.+?)\s*#*\s*$", line)
+        if match and len(match.group(1)) <= split_level:
             flush()
             lines = []
-            if len(match.group(1)) == 1:
-                title, heading = match.group(2), ""
-            else:
-                heading = match.group(2)
+            level = len(match.group(1))
+            headings[level - 1] = match.group(2)
+            # A new heading resets all deeper levels
+            headings[level:] = [""] * (split_level - level)
             continue
         lines.append(line)
     flush()
@@ -184,7 +186,7 @@ def get_embedding_model() -> SentenceTransformer:
 
 
 def config_fingerprint(
-    documents: list[dict[str, Any]], chunk_size: int, overlap: int
+    documents: list[dict[str, Any]], chunk_size: int, overlap: int, md_split_level: int
 ) -> str:
     payload = {
         "documents": [
@@ -198,19 +200,22 @@ def config_fingerprint(
         "overlap": overlap,
         "embedding_model": EMBEDDING_MODEL,
     }
+    # The split level only matters (and only triggers a rebuild hint) for Markdown
+    if any(is_text_document(doc["name"]) for doc in documents):
+        payload["md_split_level"] = md_split_level
     raw = json.dumps(payload, sort_keys=True).encode("utf-8")
     return hashlib.sha1(raw).hexdigest()[:12]
 
 
 def build_index(
-    documents: list[dict[str, Any]], chunk_size: int, overlap: int
+    documents: list[dict[str, Any]], chunk_size: int, overlap: int, md_split_level: int
 ) -> dict[str, Any]:
     """Parse PDFs/Markdown, create chunks, embed them and store them in ChromaDB."""
     pages: list[dict[str, Any]] = []
     empty_documents: list[str] = []
     for doc in documents:
         if is_text_document(doc["name"]):
-            doc_pages = extract_markdown_sections(doc["name"], doc["data"])
+            doc_pages = extract_markdown_sections(doc["name"], doc["data"], md_split_level)
         else:
             doc_pages = extract_pdf_pages(doc["name"], doc["data"])
         if not doc_pages:
@@ -232,7 +237,7 @@ def build_index(
         batch_size=32,
     )
 
-    fingerprint = config_fingerprint(documents, chunk_size, overlap)
+    fingerprint = config_fingerprint(documents, chunk_size, overlap, md_split_level)
     index_path = INDEX_ROOT / fingerprint
 
     # Rebuild cleanly whenever the user explicitly clicks "Index erstellen".
@@ -378,7 +383,7 @@ with st.sidebar:
         help=(
             f"Maximal {MAX_DOCUMENTS} Dateien mit je bis zu {MAX_FILE_SIZE_MB} MB. "
             "PDFs werden seitenweise gelesen, Markdown-Dateien an den Überschriften "
-            "(# und ##) in Abschnitte geteilt."
+            "in Abschnitte geteilt (Ebene unten unter „Markdown teilen an“ wählbar)."
         ),
     )
 
@@ -434,6 +439,18 @@ with st.sidebar:
         help="Wie viele Chunks bei der Retrieval-Suche zurückgegeben werden.",
     )
 
+    md_split_level = st.radio(
+        "Markdown teilen an",
+        options=[1, 2, 3],
+        index=1,
+        format_func=lambda level: " ".join("#" * n for n in range(1, level + 1)),
+        horizontal=True,
+        help=(
+            "Bis zu welcher Überschriftenebene Markdown-Dateien in Abschnitte geteilt werden. "
+            "Tiefere Überschriften bleiben Teil ihres Abschnitts. Gilt nicht für PDFs."
+        ),
+    )
+
     st.divider()
     st.caption(f"Embedding-Modell: `{EMBEDDING_MODEL}`")
 
@@ -452,7 +469,7 @@ if build_clicked:
         ):
             try:
                 st.session_state["rag_index"] = build_index(
-                    selected_docs, chunk_size, overlap
+                    selected_docs, chunk_size, overlap, md_split_level
                 )
                 st.session_state.pop("retrieval_results", None)
                 st.session_state.pop("retrieval_question", None)
@@ -487,7 +504,9 @@ if index_state is None:
     )
     st.stop()
 
-current_fingerprint = config_fingerprint(selected_docs, chunk_size, overlap) if selected_docs else ""
+current_fingerprint = (
+    config_fingerprint(selected_docs, chunk_size, overlap, md_split_level) if selected_docs else ""
+)
 if current_fingerprint != index_state["fingerprint"]:
     st.warning(
         "Du hast Dokumente oder Chunking-Parameter seit dem letzten Index-Build geändert. "

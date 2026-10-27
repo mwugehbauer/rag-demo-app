@@ -9,7 +9,9 @@ in der App hoch (Sidebar). Standardmäßig sind maximal **3 Dateien** mit je bis
 erlaubt; die Grenzen lassen sich oben in `app.py` über `MAX_DOCUMENTS` und `MAX_FILE_SIZE_MB`
 anpassen.
 
-Markdown-Dateien werden an den Überschriften `#` und `##` in Abschnitte geteilt. Jeder
+Markdown-Dateien werden an Überschriften in Abschnitte geteilt; in der Sidebar unter
+**Markdown teilen an** lässt sich wählen, ob bis `#`, `##` (Standard) oder `###` geteilt wird.
+Tiefere Überschriften bleiben Teil ihres Abschnitts. Jeder
 Abschnitt beginnt mit seinem Überschriftenpfad (z. B. `[Modulname › Prüfungsformen]`), damit
 auch spätere Chunks noch wissen, zu welchem Modul sie gehören. So lässt sich direkt vergleichen,
 wie sich ein Original-PDF und eine strukturiert aufbereitete Markdown-Fassung im Retrieval
