@@ -26,6 +26,9 @@ INDEX_ROOT = BASE_DIR / ".chroma_demo"
 MAX_DOCUMENTS = 3
 MAX_FILE_SIZE_MB = 20
 
+# Markdown/plain text is split at headings instead of PDF pages
+TEXT_SUFFIXES = (".md", ".markdown", ".txt")
+
 EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 COLLECTION_NAME = "hochschule_koblenz_rag_demo"
 
@@ -65,6 +68,7 @@ def extract_pdf_pages(file_name: str, data: bytes) -> list[dict[str, Any]]:
                 {
                     "source": file_name,
                     "page": page_number,
+                    "location": f"Seite {page_number}",
                     "text": text,
                 }
             )
@@ -72,7 +76,60 @@ def extract_pdf_pages(file_name: str, data: bytes) -> list[dict[str, Any]]:
     return pages
 
 
-def chunk_text(text: str, chunk_size: int, overlap: int) -> list[str]:
+def is_text_document(file_name: str) -> bool:
+    return Path(file_name).suffix.lower() in TEXT_SUFFIXES
+
+
+@st.cache_data(show_spinner=False)
+def extract_markdown_sections(file_name: str, data: bytes) -> list[dict[str, Any]]:
+    """Split Markdown/text at '#' and '##' headings; each section acts like a page.
+
+    Each section starts with its heading path (e.g. "Modulname › Prüfungsformen"),
+    so a chunk still names the module it belongs to.
+    """
+    try:
+        raw = data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        raw = data.decode("cp1252", errors="replace")
+
+    sections: list[dict[str, Any]] = []
+    title = ""
+    heading = ""
+    lines: list[str] = []
+
+    def flush() -> None:
+        text = clean_text("\n".join(lines))
+        if not text:
+            return
+        path = " › ".join(part for part in (title, heading) if part)
+        label = path or "Einleitung"
+        number = len(sections) + 1
+        sections.append(
+            {
+                "source": file_name,
+                "page": number,
+                "location": f"Abschnitt {number} · {label}",
+                "text": f"[{label}]\n{text}" if path else text,
+            }
+        )
+
+    for line in raw.splitlines():
+        match = re.match(r"^(#{1,2})\s+(.+?)\s*#*\s*$", line)
+        if match:
+            flush()
+            lines = []
+            if len(match.group(1)) == 1:
+                title, heading = match.group(2), ""
+            else:
+                heading = match.group(2)
+            continue
+        lines.append(line)
+    flush()
+
+    return sections
+
+
+def chunk_text(text: str, chunk_size: int, overlap: int, min_words: int = 15) -> list[str]:
     """Split text into overlapping word-based chunks."""
     if overlap >= chunk_size:
         raise ValueError("Chunk Overlap muss kleiner als Chunk Size sein.")
@@ -83,7 +140,7 @@ def chunk_text(text: str, chunk_size: int, overlap: int) -> list[str]:
 
     for start in range(0, len(words), step):
         chunk_words = words[start : start + chunk_size]
-        if len(chunk_words) < 15:
+        if len(chunk_words) < min_words:
             continue
         chunks.append(" ".join(chunk_words))
 
@@ -98,7 +155,10 @@ def create_chunks(
     global_id = 0
 
     for page in pages:
-        page_chunks = chunk_text(page["text"], chunk_size, overlap)
+        # Markdown sections are often short (e.g. "## Lehrende"), so keep them
+        # instead of applying the PDF minimum of 15 words.
+        min_words = 1 if is_text_document(page["source"]) else 15
+        page_chunks = chunk_text(page["text"], chunk_size, overlap, min_words)
 
         for chunk_on_page, text in enumerate(page_chunks, start=1):
             all_chunks.append(
@@ -106,6 +166,7 @@ def create_chunks(
                     "id": f"chunk_{global_id}",
                     "source": page["source"],
                     "page": int(page["page"]),
+                    "location": page["location"],
                     "chunk_on_page": int(chunk_on_page),
                     "word_count": len(text.split()),
                     "text": text,
@@ -144,11 +205,14 @@ def config_fingerprint(
 def build_index(
     documents: list[dict[str, Any]], chunk_size: int, overlap: int
 ) -> dict[str, Any]:
-    """Parse PDFs, create chunks, embed them and store them in ChromaDB."""
+    """Parse PDFs/Markdown, create chunks, embed them and store them in ChromaDB."""
     pages: list[dict[str, Any]] = []
     empty_documents: list[str] = []
     for doc in documents:
-        doc_pages = extract_pdf_pages(doc["name"], doc["data"])
+        if is_text_document(doc["name"]):
+            doc_pages = extract_markdown_sections(doc["name"], doc["data"])
+        else:
+            doc_pages = extract_pdf_pages(doc["name"], doc["data"])
         if not doc_pages:
             empty_documents.append(doc["name"])
         pages.extend(doc_pages)
@@ -156,7 +220,7 @@ def build_index(
     chunks = create_chunks(pages, chunk_size, overlap)
     if not chunks:
         raise RuntimeError(
-            "Es konnten keine Chunks erzeugt werden. Enthalten die PDFs eine Textebene? "
+            "Es konnten keine Chunks erzeugt werden. Enthalten die Dokumente Text? "
             "Gescannte PDFs (nur Bilder) werden nicht unterstützt."
         )
 
@@ -200,6 +264,7 @@ def build_index(
                 {
                     "source": chunk["source"],
                     "page": chunk["page"],
+                    "location": chunk["location"],
                     "chunk_on_page": chunk["chunk_on_page"],
                     "word_count": chunk["word_count"],
                 }
@@ -249,7 +314,7 @@ def retrieve(
                 "Rank": i + 1,
                 "Similarity": round(1.0 - distance, 3),
                 "Quelle": metadata["source"],
-                "Seite": int(metadata["page"]),
+                "Fundstelle": metadata.get("location", f"Seite {int(metadata['page'])}"),
                 "Chunk": int(metadata["chunk_on_page"]),
                 "Wörter": int(metadata.get("word_count", len(document.split()))),
                 "Text": document,
@@ -264,7 +329,7 @@ def build_augmented_prompt(question: str, result_df: pd.DataFrame) -> str:
     for _, row in result_df.iterrows():
         contexts.append(
             f"SOURCE: {row['Quelle']}\n"
-            f"PAGE: {row['Seite']}\n"
+            f"LOCATION: {row['Fundstelle']}\n"
             f"RETRIEVAL_SIMILARITY: {row['Similarity']}\n\n"
             f"{row['Text']}"
         )
@@ -273,7 +338,7 @@ def build_augmented_prompt(question: str, result_df: pd.DataFrame) -> str:
 
     return f"""Beantworte die folgende Frage ausschließlich auf Basis des bereitgestellten Kontextes.
 Wenn der Kontext keine ausreichende Information enthält, sage dies ausdrücklich.
-Nenne bei wichtigen Aussagen die Quelle und Seite.
+Nenne bei wichtigen Aussagen die Quelle und Fundstelle (Seite bzw. Abschnitt).
 
 FRAGE:
 {question}
@@ -300,17 +365,21 @@ def overlap_preview(previous_text: str, current_text: str, configured_overlap: i
 st.title("RAG Lab: Chunking, Embeddings & Retrieval")
 st.caption(
     "Didaktische Demo mit eigenen Dokumenten: "
-    "PDF → Chunking → Embeddings → ChromaDB → Top-k Retrieval → Augmented Prompt"
+    "PDF/Markdown → Chunking → Embeddings → ChromaDB → Top-k Retrieval → Augmented Prompt"
 )
 
 with st.sidebar:
     st.header("Dokumente")
 
     uploaded_files = st.file_uploader(
-        "PDFs hochladen",
-        type=["pdf"],
+        "PDFs oder Markdown-Dateien hochladen",
+        type=["pdf", *(suffix.lstrip(".") for suffix in TEXT_SUFFIXES)],
         accept_multiple_files=True,
-        help=f"Maximal {MAX_DOCUMENTS} PDFs mit je bis zu {MAX_FILE_SIZE_MB} MB.",
+        help=(
+            f"Maximal {MAX_DOCUMENTS} Dateien mit je bis zu {MAX_FILE_SIZE_MB} MB. "
+            "PDFs werden seitenweise gelesen, Markdown-Dateien an den Überschriften "
+            "(# und ##) in Abschnitte geteilt."
+        ),
     )
 
     # Validate uploads: size limit, duplicates, max number of documents.
@@ -376,10 +445,10 @@ with st.sidebar:
 
 if build_clicked:
     if not selected_docs:
-        st.sidebar.error("Bitte mindestens ein PDF hochladen.")
+        st.sidebar.error("Bitte mindestens ein Dokument hochladen.")
     else:
         with st.spinner(
-            "PDFs lesen, Chunks erzeugen, Embeddings berechnen und ChromaDB aufbauen …"
+            "Dokumente lesen, Chunks erzeugen, Embeddings berechnen und ChromaDB aufbauen …"
         ):
             try:
                 st.session_state["rag_index"] = build_index(
@@ -397,7 +466,8 @@ index_state = st.session_state.get("rag_index")
 
 if index_state is None:
     st.info(
-        f"Lade links bis zu {MAX_DOCUMENTS} PDFs hoch, wähle die RAG-Parameter und klicke "
+        f"Lade links bis zu {MAX_DOCUMENTS} PDFs oder Markdown-Dateien hoch, wähle die "
+        "RAG-Parameter und klicke "
         "anschließend auf **Index erstellen / neu aufbauen**. Beim ersten Start wird das "
         "Embedding-Modell einmalig heruntergeladen."
     )
@@ -406,7 +476,8 @@ if index_state is None:
         """
 ### Was die App demonstriert
 
-1. **Parsing:** Text wird aus den hochgeladenen PDFs extrahiert.
+1. **Parsing:** Text wird aus den hochgeladenen PDFs (seitenweise) oder Markdown-Dateien
+   (abschnittsweise) extrahiert.
 2. **Chunking:** Text wird in überlappende Wissenseinheiten zerlegt.
 3. **Embeddings:** Jeder Chunk wird in einen numerischen Vektor übersetzt.
 4. **Vector Store:** ChromaDB speichert Text, Metadaten und Vektoren.
@@ -431,7 +502,11 @@ if index_state["empty_documents"]:
 
 # Index summary
 metric_cols = st.columns(4)
-metric_cols[0].metric("Seiten", index_state["page_count"])
+has_text_documents = any(is_text_document(name) for name in index_state["documents"])
+metric_cols[0].metric(
+    "Seiten / Abschnitte" if has_text_documents else "Seiten",
+    index_state["page_count"],
+)
 metric_cols[1].metric("Chunks", index_state["chunk_count"])
 metric_cols[2].metric("Embedding-Dimensionen", index_state["embedding_dimension"])
 metric_cols[3].metric(
@@ -463,8 +538,8 @@ with chunk_tab:
             {
                 "Index": i,
                 "Quelle": chunk["source"],
-                "Seite": chunk["page"],
-                "Chunk auf Seite": chunk["chunk_on_page"],
+                "Fundstelle": chunk["location"],
+                "Chunk": chunk["chunk_on_page"],
                 "Wörter": chunk["word_count"],
                 "Vorschau": chunk["text"][:180] + ("…" if len(chunk["text"]) > 180 else ""),
             }
@@ -490,8 +565,8 @@ with chunk_tab:
 
     st.markdown(
         f"**Quelle:** `{selected_chunk['source']}`  ·  "
-        f"**Seite:** {selected_chunk['page']}  ·  "
-        f"**Chunk auf Seite:** {selected_chunk['chunk_on_page']}  ·  "
+        f"**Fundstelle:** {selected_chunk['location']}  ·  "
+        f"**Chunk:** {selected_chunk['chunk_on_page']}  ·  "
         f"**Wörter:** {selected_chunk['word_count']}"
     )
     st.text_area(
@@ -522,8 +597,8 @@ with chunk_tab:
             right.code(curr_head, language=None)
         else:
             st.caption(
-                "Der vorherige Chunk gehört zu einer anderen Seite/Quelle; daher wird hier kein "
-                "seitenübergreifender Overlap verwendet."
+                "Der vorherige Chunk gehört zu einer anderen Seite, einem anderen Abschnitt oder "
+                "einer anderen Quelle; daher wird hier kein übergreifender Overlap verwendet."
             )
 
 
@@ -556,14 +631,14 @@ with retrieval_tab:
     if result_df is not None and not result_df.empty:
         st.markdown(f"**Letzte Retrieval-Frage:** {retrieval_question}")
 
-        summary = result_df[["Rank", "Similarity", "Quelle", "Seite", "Chunk", "Wörter"]]
+        summary = result_df[["Rank", "Similarity", "Quelle", "Fundstelle", "Chunk", "Wörter"]]
         st.dataframe(summary, hide_index=True, use_container_width=True)
 
         st.markdown("#### Retrieved Chunks")
         for _, row in result_df.iterrows():
             title = (
                 f"#{int(row['Rank'])} · Similarity {row['Similarity']:.3f} · "
-                f"{row['Quelle']} · Seite {int(row['Seite'])}"
+                f"{row['Quelle']} · {row['Fundstelle']}"
             )
             with st.expander(title, expanded=int(row["Rank"]) <= 2):
                 st.write(row["Text"])
